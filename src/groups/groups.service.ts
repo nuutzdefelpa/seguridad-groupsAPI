@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { SupabaseService } from '../supabase/supabase.service';
 import type { CurrentUser } from '../common/interfaces/current-user.interface';
 import { CreateGroupDto } from './dto/create-group.dto';
@@ -29,9 +29,37 @@ export class GroupsService {
   constructor(private readonly supabaseService: SupabaseService) {}
 
   async listGroups(currentUser: CurrentUser) {
+    const userId = currentUser.profile.id;
+    const canViewAllGroups = await this.hasPermission(userId, 'groups:view');
+
+    if (canViewAllGroups) {
+      const { data, error } = await this.supabaseService.adminClient
+        .from('groups')
+        .select('*');
+
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      return {
+        groups: data as GroupRecord[],
+      };
+    }
+
+    const canViewOwnGroups = await this.hasPermission(userId, 'group:view');
+    if (!canViewOwnGroups) {
+      throw new ForbiddenException('Missing permission to view groups');
+    }
+
+    const memberGroupIds = await this.getMemberGroupIds(userId);
+    if (memberGroupIds.length === 0) {
+      return { groups: [] };
+    }
+
     const { data, error } = await this.supabaseService.adminClient
       .from('groups')
-      .select('*');
+      .select('*')
+      .in('id', memberGroupIds);
 
     if (error) {
       throw new Error(error.message);
@@ -43,6 +71,8 @@ export class GroupsService {
   }
 
   async getGroup(currentUser: CurrentUser, groupId: string) {
+    await this.assertCanViewGroup(currentUser, groupId);
+
     const { data, error } = await this.supabaseService.adminClient
       .from('groups')
       .select('*')
@@ -111,6 +141,8 @@ export class GroupsService {
   }
 
   async listGroupMembers(currentUser: CurrentUser, groupId: string) {
+    await this.assertCanViewGroup(currentUser, groupId);
+
     // Verify group exists
     const { data: group, error: groupError } = await this.supabaseService.adminClient
       .from('groups')
@@ -138,6 +170,7 @@ export class GroupsService {
       const { data: userRows, error: usersError } = await this.supabaseService.adminClient
         .from('users')
         .select('id, username, full_name, email')
+        .is('deleted_at', null)
         .in('id', memberIds);
 
       if (usersError) {
@@ -163,6 +196,7 @@ export class GroupsService {
         .from('users')
         .select('id')
         .eq('email', dto.email.toLowerCase())
+        .is('deleted_at', null)
         .single();
 
       if (userError || !user) {
@@ -175,6 +209,7 @@ export class GroupsService {
         .from('users')
         .select('id')
         .eq('username', dto.username.toLowerCase())
+        .is('deleted_at', null)
         .single();
 
       if (userError || !user) {
@@ -216,5 +251,60 @@ export class GroupsService {
     }
 
     return { success: true };
+  }
+
+  private async assertCanViewGroup(currentUser: CurrentUser, groupId: string) {
+    const userId = currentUser.profile.id;
+    const canViewAllGroups = await this.hasPermission(userId, 'groups:view');
+    if (canViewAllGroups) {
+      return;
+    }
+
+    const canViewOwnGroups = await this.hasPermission(userId, 'group:view');
+    const isMember = await this.isGroupMember(userId, groupId);
+    if (!canViewOwnGroups || !isMember) {
+      throw new ForbiddenException('Missing permission to view this group');
+    }
+  }
+
+  private async getMemberGroupIds(userId: string) {
+    const { data, error } = await this.supabaseService.adminClient
+      .from('group_members')
+      .select('group_id')
+      .eq('user_id', userId);
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    return (data as Array<{ group_id: string }>).map((item) => item.group_id);
+  }
+
+  private async isGroupMember(userId: string, groupId: string) {
+    const { data, error } = await this.supabaseService.adminClient
+      .from('group_members')
+      .select('id')
+      .match({ user_id: userId, group_id: groupId })
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    return Boolean(data);
+  }
+
+  private async hasPermission(userId: string, permissionCode: string) {
+    const { data, error } = await this.supabaseService.adminClient.rpc('user_has_permission', {
+      p_user_id: userId,
+      p_permission_code: permissionCode,
+      p_group_id: null,
+    });
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    return Boolean(data);
   }
 }
